@@ -17,7 +17,7 @@ if __name__ == '__main__':
                             schedule = 'cosine')
 
     # Initial parameters with codebooks of SpeechTokenizer
-    sp_params = '/remote-home/xzhang/Speech/SpeechTokenizer/ckpt/SpeechTokenizer.pt'
+    sp_params = 'SpeechTokenizer/SpeechTokenizer.pt'
     sp_params = torch.load(sp_params, map_location='cpu')
     soundstorm.semantic_token_emb.weight = torch.nn.Parameter(sp_params['quantizer.vq.layers.0._codebook.embed'])
     acoustic_embeds = []
@@ -29,10 +29,10 @@ if __name__ == '__main__':
 
 
     # Tokens file
-    train_file_list = '/path/train_file_list.txt'
+    train_file_list = 'filelists/train.list'
     with open(train_file_list, 'r') as f:
         train_file_list = f.readlines()
-    valid_file_list = '/path/valid_file_list.txt'
+    valid_file_list = 'filelists/val.list'
     with open(valid_file_list, 'r') as f:
         valid_file_list = f.readlines()
 

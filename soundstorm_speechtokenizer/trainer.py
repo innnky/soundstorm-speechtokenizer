@@ -3,6 +3,7 @@ import re
 import os
 from shutil import rmtree
 
+import soundfile
 from beartype import beartype
 from beartype.typing import Optional
 
@@ -12,6 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset
 from einops import rearrange
 
+import vits_decoder
 from .dataset import get_dataloader, SoundStormDataset
 from .optimizer import get_optimizer
 from .soundstorm import SoundStorm
@@ -92,7 +94,8 @@ class SoundStormTrainer(nn.Module):
         drop_last = False,
         num_ckpt_keep = 8,
         num_workers = 8,
-        force_clear_prev_results = None
+        force_clear_prev_results = None,
+        decoder = None
     ):
         super().__init__()
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -112,12 +115,12 @@ class SoundStormTrainer(nn.Module):
         self.num_warmup_steps = num_warmup_steps
         self.batch_size = batch_size
         self.grad_accum_every = grad_accum_every
-        
+
 
         # max grad norm
 
         self.max_grad_norm = max_grad_norm
-        
+
         self.tokenizer = tokenizer
         if exists(self.tokenizer):
             self.tokenizer.eval()
@@ -145,7 +148,7 @@ class SoundStormTrainer(nn.Module):
                                             **tokenizer_kwargs)
         if self.is_main:
             self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-            
+
         self.is_raw_wav = is_raw_wav
 
 
@@ -156,7 +159,7 @@ class SoundStormTrainer(nn.Module):
 
         self.dl = get_dataloader(self.ds, is_raw_wav=is_raw_wav, batch_size = batch_size, shuffle = True, drop_last = drop_last, num_workers=num_workers)
         self.valid_dl = get_dataloader(self.valid_ds, is_raw_wav=is_raw_wav, batch_size = batch_size, shuffle = False, drop_last = False, num_workers=num_workers)
-        
+
         # optimizer
 
         self.optim = get_optimizer(
@@ -170,10 +173,10 @@ class SoundStormTrainer(nn.Module):
         self.initial_lr = initial_lr
         num_train_steps = epochs * self.ds.__len__() // (batch_size * grad_accum_every)
         self.scheduler = CosineAnnealingLR(self.optim, T_max = num_train_steps)
-        
-        
 
-        
+
+
+
         # prepare with accelerator
 
         (
@@ -194,7 +197,7 @@ class SoundStormTrainer(nn.Module):
 
         self.log_steps = log_steps
         self.save_model_steps = save_model_steps
-        
+
 
         self.results_folder = Path(results_folder)
         self.num_ckpt_keep = num_ckpt_keep
@@ -203,10 +206,11 @@ class SoundStormTrainer(nn.Module):
         #     rmtree(str(self.results_folder))
         if not self.results_folder.exists():
             self.results_folder.mkdir(parents = True, exist_ok = True)
-        
+
         hps = {"num_train_steps": num_train_steps, "num_warmup_steps": num_warmup_steps, "learning_rate": lr, "initial_learning_rate": lr, "epochs": epochs}
         self.accelerator.init_trackers("soundstorm", config=hps)
         self.best_dev_loss = float('inf')
+        self.decoder = decoder
 
     def save(self, path, dev_loss):
         if dev_loss < self.best_dev_loss:
@@ -244,12 +248,12 @@ class SoundStormTrainer(nn.Module):
 
     def print(self, msg):
         self.accelerator.print(msg)
-        
+
     def tokenize(self, batch):
-        
+
         if not exists(self.tokenizer):
             raise ModuleNotFoundError('No tokenizer in trainer but inputs are raw waves')
-        
+
         wav, length = batch
         if isinstance(length, list):
             length = torch.tensor(length)
@@ -268,7 +272,7 @@ class SoundStormTrainer(nn.Module):
         semantic_token_ids = semantic_token_ids.masked_fill(~mask, tmp_model.semantic_pad_id)
         mask = mask.unsqueeze(-1).repeat(1, 1, tmp_model.num_quantizers)
         acoustic_token_ids = acoustic_token_ids.masked_fill(~mask, tmp_model.pad_id)
-        
+
         return semantic_token_ids, acoustic_token_ids
 
     # def generate(self, *args, **kwargs):
@@ -297,12 +301,12 @@ class SoundStormTrainer(nn.Module):
             return self.lr
 
     def train(self):
-        
+
         self.model.train()
-        
+
         grad_accum = 0
         logs = {}
-        steps = int(self.steps.item())               
+        steps = int(self.steps.item())
         if steps < self.num_warmup_steps:
             lr = self.warmup(steps)
             for param_group in self.optim.param_groups:
@@ -310,28 +314,28 @@ class SoundStormTrainer(nn.Module):
         else:
             self.scheduler.step()
             lr = self.scheduler.get_last_lr()[0]
-            
+
         for epoch in range(self.epochs):
             if self.is_main:
                 print(f'Epoch:{epoch} start...')
-                    
+
             for batch in self.dl:
-                
+
                 if self.is_raw_wav:
                     semantic_token_ids, acoustic_token_ids = self.tokenize(batch)
                 else:
                     semantic_token_ids, acoustic_token_ids = batch
-                
+
                 loss, acc, _ = self.model(x = acoustic_token_ids,
                                      cond_ids=semantic_token_ids)
-                
+
                 accum_log(logs, {'loss': loss.item() / self.grad_accum_every, 'acc': acc.item() / self.grad_accum_every})
-                
+
                 self.accelerator.backward(loss / self.grad_accum_every)
                 grad_accum += 1
                 # self.accelerator.wait_for_everyone()
-                
-                
+
+
                 # update params
                 if grad_accum == self.grad_accum_every:
                     if exists(self.max_grad_norm):
@@ -339,18 +343,18 @@ class SoundStormTrainer(nn.Module):
                     self.optim.step()
                     self.optim.zero_grad()
                     grad_accum = 0
-                    
+
                     # log
                     if self.is_main and not (steps % self.log_steps):
                         self.print(f"Epoch {epoch} -- Step {steps}: loss: {logs['loss']:0.3f}\tacc:{logs['acc']:0.3f}")
                         self.accelerator.log({"train/loss": logs['loss'], "train/acc": logs['acc'], "train/learning_rate": lr}, step=steps)
                     logs = {}
-                    
+
                     self.accelerator.wait_for_everyone()
-                    
+
                     # validate and save model
                     if self.is_main and not(steps % self.save_model_steps):
-                        
+
                         # validate
                         losses = []
                         total_loss = 0.0
@@ -370,28 +374,42 @@ class SoundStormTrainer(nn.Module):
                                 total_loss += loss.item() * b
                                 losses.append(loss.item())
                                 total_acc += acc.item() * b
-                        self.print(f'{steps}: valid loss {total_loss / num:0.3f}, valid acc {total_acc / num:0.3f}')  
-                        self.accelerator.log({"valid/loss": total_loss / num, "valid/acc": total_acc / num}, step=steps) 
-                        
+
+
+                                if self.decoder is not None:
+                                    token_gen = self.model.genenrate(semantic_tokens=semantic_token_ids[:1],
+                                                                     prompt_tokens=acoustic_token_ids[:1, :150, :],
+                                                                     steps=8,
+                                                                     greedy=True)
+                                    wav = vits_decoder.decode_tokens(self.decoder, token_gen)
+                                    os.makedirs(f'{self.results_folder}/wav', exist_ok=True)
+                                    soundfile.write(f'{self.results_folder}/wav/{steps:08d}.wav', wav, 44100)
+                                    token_gt = torch.cat([semantic_token_ids[:1], acoustic_token_ids[:1]], axis=1)
+                                    wav_gt = vits_decoder.decode_tokens(self.decoder, token_gt)
+                                    soundfile.write(f'{self.results_folder}/wav/{steps:08d}_gt.wav', wav_gt, 44100)
+
+                        self.print(f'{steps}: valid loss {total_loss / num:0.3f}, valid acc {total_acc / num:0.3f}')
+                        self.accelerator.log({"valid/loss": total_loss / num, "valid/acc": total_acc / num}, step=steps)
+
                         # save model
                         model_path = str(self.results_folder / f'SoundStormTrainer_{steps:08d}')
-                        self.save(model_path, total_loss / num)                        
+                        self.save(model_path, total_loss / num)
                         self.print(f'{steps}: saving model to {str(self.results_folder)}')
                         self.model.train()
-                        
+
                     # Update lr    
                     self.steps += 1
-                    steps = int(self.steps.item())               
+                    steps = int(self.steps.item())
                     if steps < self.num_warmup_steps:
                         lr = self.warmup(steps)
                         for param_group in self.optim.param_groups:
                             param_group['lr'] = lr
                     else:
-                        self.scheduler.step() 
-                        lr = self.scheduler.get_last_lr()[0]       
-            
+                        self.scheduler.step()
+                        lr = self.scheduler.get_last_lr()[0]
+
         self.print('training complete')
-        
+
     def continue_train(self):
         self.load()
         self.train()

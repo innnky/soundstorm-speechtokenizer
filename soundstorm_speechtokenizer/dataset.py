@@ -76,7 +76,8 @@ class SoundStormDataset(Dataset):
     def __getitem__(self, index):
         file = self.file_list[index].strip()
         if self.is_tokens:
-            tokens = torch.from_numpy(np.load(file))
+            token_path = file.replace(".wav", ".tokens.pt")
+            tokens = torch.load(token_path).T
             semantic_tokens = tokens[:, 0]
             acoustic_tokens = tokens[:, 1:]
             return semantic_tokens[:self.max_sequence], acoustic_tokens[:self.max_sequence]
